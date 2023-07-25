@@ -5,12 +5,11 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
-	"log"
 	"os"
 	"os/exec"
 	"strconv"
 
+	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin"
 	"github.com/hashicorp/go-plugin/examples/bidirectional/shared"
 )
@@ -23,15 +22,19 @@ func (*addHelper) Sum(a, b int64) (int64, error) {
 
 func main() {
 	// We don't want to see the plugin logs.
-	log.SetOutput(ioutil.Discard)
+	//log.SetOutput(ioutil.Discard)
 
 	// We're a host. Start by launching the plugin process.
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig: shared.Handshake,
 		Plugins:         shared.PluginMap,
-		Cmd:             exec.Command("sh", "-c", os.Getenv("COUNTER_PLUGIN")),
+		Cmd:             exec.Command(os.Getenv("COUNTER_PLUGIN")),
+		Logger:          hclog.Default(),
 		AllowedProtocols: []plugin.Protocol{
-			plugin.ProtocolNetRPC, plugin.ProtocolGRPC},
+			plugin.ProtocolNetRPC, plugin.ProtocolGRPC,
+		},
+		SyncStdout: os.Stdout,
+		SyncStderr: os.Stderr,
 	})
 	defer client.Kill()
 

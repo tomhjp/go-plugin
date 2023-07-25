@@ -5,7 +5,9 @@ package plugin
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,21 +17,28 @@ import (
 	"hash"
 	"io"
 	"io/ioutil"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
+	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+	"github.com/tetratelabs/wazero/sys"
 	"google.golang.org/grpc"
 )
 
-const unrecognizedRemotePluginMessage = `Unrecognized remote plugin message: %s
+const unrecognizedRemotePluginMessage = `Unrecognized remote plugin message: %q
 This usually means
   the plugin was not compiled for this architecture,
   the plugin is missing dynamic-link libraries necessary to run,
@@ -106,6 +115,8 @@ type Client struct {
 	// processKilled is used for testing only, to flag when the process was
 	// forcefully killed.
 	processKilled bool
+
+	lnFile *os.File
 }
 
 // NegotiatedVersion returns the protocol version negotiated with the server.
@@ -555,18 +566,9 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	}
 
 	cmd := c.config.Cmd
-	cmd.Env = append(cmd.Env, os.Environ()...)
+	// cmd.Env = append(cmd.Env, os.Environ()...)
 	cmd.Env = append(cmd.Env, env...)
 	cmd.Stdin = os.Stdin
-
-	cmdStdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	cmdStderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
 
 	if c.config.SecureConfig != nil {
 		if ok, err := c.config.SecureConfig.Check(cmd.Path); err != nil {
@@ -601,22 +603,151 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		}
 	}
 
-	c.logger.Debug("starting plugin", "path", cmd.Path, "args", cmd.Args)
-	err = cmd.Start()
-	if err != nil {
-		return
-	}
+	var cmdStdout, cmdStderr io.Reader
+	var cmdWait, cmdKill func() error
+	if strings.HasSuffix(cmd.Path, ".wasm") {
+		stdout := bytes.NewBuffer(nil)
+		cmdStdout = stdout
+		stderr := bytes.NewBuffer(nil)
+		cmdStderr = stderr
+		ctx := context.Background()
+		r := wazero.NewRuntime(ctx)
+		_, err = wasi_snapshot_preview1.Instantiate(ctx, r)
+		if err != nil {
+			return nil, err
+		}
 
-	// Set the process
-	c.process = cmd.Process
-	c.logger.Debug("plugin started", "path", cmd.Path, "pid", c.process.Pid)
+		// Create server and client sockets for WASM module to use.
+		hostLn, err := serverListener()
+		if err != nil {
+			return nil, fmt.Errorf("error starting host listener: %w", err)
+		}
+		defer hostLn.Close()
+		pluginLn, err := serverListener()
+		if err != nil {
+			return nil, fmt.Errorf("error starting plugin listener: %w", err)
+		}
+
+		info, err := os.Lstat(path.Clean(pluginLn.Addr().String()))
+		if err != nil {
+			return nil, fmt.Errorf("error stat'ing listener file: %w", err)
+		}
+		c.logger.Info("File info", "name", info.Name(), "size", info.Size(), "mod time", info.ModTime(), "mode", info.Mode(), "is dir", info.IsDir())
+		//defer pluginLn.Close()
+		// hostConn, err := netAddrDialer(pluginLn.Addr(), nil)("", 0)
+		// if err != nil {
+		// 	return nil, fmt.Errorf("error connecting to plugin listener: %w", err)
+		// }
+		pluginConn, err := netAddrDialer(hostLn.Addr(), nil)("", 0)
+		if err != nil {
+			return nil, fmt.Errorf("error connecting to host listener: %w", err)
+		}
+		fdFromConn := func(conn syscall.Conn) (uintptr, error) {
+			rawConn, err := conn.SyscallConn()
+			if err != nil {
+				return 0, err
+			}
+			var rawFd uintptr
+			err = rawConn.Control(func(fd uintptr) {
+				rawFd = fd
+			})
+			return rawFd, nil
+		}
+		pluginLnFd, err := fdFromConn(pluginLn.(*rmListener).Listener.(*net.UnixListener))
+		if err != nil {
+			return nil, err
+		}
+		pluginConnFd, err := fdFromConn(pluginConn.(*net.UnixConn))
+		if err != nil {
+			return nil, err
+		}
+		hostLnFd, err := fdFromConn(hostLn.(*rmListener).Listener.(*net.UnixListener))
+		if err != nil {
+			return nil, err
+		}
+		c.lnFile = os.NewFile(hostLnFd, hostLn.Addr().String())
+		cmd.Env = append(cmd.Env,
+			fmt.Sprintf("GO_PLUGIN_LISTENER_FD=%v", pluginLnFd),
+			fmt.Sprintf("GO_PLUGIN_LISTENER_PATH=%v", pluginLn.Addr().String()),
+			fmt.Sprintf("GO_PLUGIN_DIAL_FD=%v", pluginConnFd),
+			fmt.Sprintf("GO_PLUGIN_DIAL_PATH=%v", pluginConn.RemoteAddr().String()),
+		)
+
+		config := wazero.NewModuleConfig().
+			WithStdin(os.Stdin).
+			WithStdout(stdout).
+			WithStderr(stderr).
+			WithArgs(append([]string{cmd.Path}, cmd.Args...)...).
+			// TODO: Implement file system that restricts access to a list of named files.
+			WithFS(os.DirFS("."))
+		for _, env := range cmd.Env {
+			parts := strings.SplitN(env, "=", 2)
+			if len(parts) != 2 {
+				return nil, fmt.Errorf("poorly specified env entry in plugin command: %s", env)
+			}
+			// c.logger.Info("setting env", "key", parts[0], "value", parts[1])
+			config = config.WithEnv(parts[0], parts[1])
+		}
+		moduleBytes, err := os.ReadFile(cmd.Path)
+		if err != nil {
+			return nil, err
+		}
+		var wg sync.WaitGroup
+		var module api.Module
+		wg.Add(1)
+		// go func() {
+		module, err = r.InstantiateWithConfig(ctx, moduleBytes, config)
+		if err != nil {
+			if exitErr, ok := err.(*sys.ExitError); ok && exitErr.ExitCode() != 0 {
+				c.logger.Error("non-zero plugin exit code", "code", exitErr.ExitCode(), "stdout", string(stdout.Bytes()), "stderr", string(stderr.Bytes()))
+				return nil, err
+			} else if !ok {
+				c.logger.Error("error starting WASM module", "error", err)
+				return nil, err
+			}
+		}
+		wg.Done()
+		// }()
+		cmdKill = func() error {
+			if module != nil {
+				return module.Close(ctx)
+			}
+
+			return nil
+		}
+		cmdWait = func() error {
+			wg.Wait()
+			return nil
+		}
+	} else {
+		cmdStdout, err = cmd.StdoutPipe()
+		if err != nil {
+			return nil, err
+		}
+		cmdStderr, err = cmd.StderrPipe()
+		if err != nil {
+			return nil, err
+		}
+
+		c.logger.Debug("starting plugin", "path", cmd.Path, "args", cmd.Args)
+		err = cmd.Start()
+		if err != nil {
+			return
+		}
+
+		// Set the process
+		c.process = cmd.Process
+		c.logger.Debug("plugin started", "path", cmd.Path, "pid", c.process.Pid)
+		cmdWait = cmd.Wait
+		cmdKill = cmd.Process.Kill
+	}
 
 	// Make sure the command is properly cleaned up if there is an error
 	defer func() {
 		r := recover()
 
 		if err != nil || r != nil {
-			cmd.Process.Kill()
+			cmdKill()
 		}
 
 		if r != nil {
@@ -642,7 +773,10 @@ func (c *Client) Start() (addr net.Addr, err error) {
 
 		// get the cmd info early, since the process information will be removed
 		// in Kill.
-		pid := c.process.Pid
+		pid := os.Getpid()
+		if c.process != nil {
+			pid = c.process.Pid
+		}
 		path := cmd.Path
 
 		// wait to finish reading from stderr since the stderr pipe reader
@@ -650,7 +784,7 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		c.stderrWaitGroup.Wait()
 
 		// Wait for the command to end.
-		err := cmd.Wait()
+		err := cmdWait()
 
 		msgArgs := []interface{}{
 			"path", path,
@@ -954,13 +1088,45 @@ func (c *Client) Protocol() Protocol {
 	return c.protocol
 }
 
-func netAddrDialer(addr net.Addr) func(string, time.Duration) (net.Conn, error) {
+func netAddrDialer(addr net.Addr, dialFile *os.File) func(string, time.Duration) (net.Conn, error) {
 	return func(_ string, _ time.Duration) (net.Conn, error) {
-		// Connect to the client
-		conn, err := net.Dial(addr.Network(), addr.String())
+		var conn net.Conn
+		var err error
+
+		if dialFile != nil {
+			// 	rawConn, err := (conn.(*net.UnixConn)).SyscallConn()
+			// if err != nil {
+			// 	return nil, err
+			// }
+			// var rawFd uintptr
+			// err = rawConn.Control(func(fd uintptr) {
+			// 	rawFd = fd
+			// })
+			conn, err = net.FileConn(dialFile)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			// Connect to the client
+			conn, err = net.Dial(addr.Network(), addr.String())
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		rawConn, err := (conn.(*net.UnixConn)).SyscallConn()
 		if err != nil {
 			return nil, err
 		}
+		var rawFd uintptr
+		err = rawConn.Control(func(fd uintptr) {
+			rawFd = fd
+		})
+		num, _ := rand.Int(rand.Reader, big.NewInt(1000))
+		if err := os.WriteFile(fmt.Sprintf("log%s", num), []byte(fmt.Sprintf("established client conn; rawFd: %v laddr: %s@%s, raddr: %s@%s\n", rawFd, conn.LocalAddr().Network(), conn.LocalAddr().String(), conn.RemoteAddr().Network(), conn.RemoteAddr().String())), 0o644); err != nil {
+			return nil, err
+		}
+
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			// Make sure to set keep alive so that the connection doesn't die
 			tcpConn.SetKeepAlive(true)
@@ -973,7 +1139,7 @@ func netAddrDialer(addr net.Addr) func(string, time.Duration) (net.Conn, error) 
 // dialer is compatible with grpc.WithDialer and creates the connection
 // to the plugin.
 func (c *Client) dialer(_ string, timeout time.Duration) (net.Conn, error) {
-	conn, err := netAddrDialer(c.address)("", timeout)
+	conn, err := netAddrDialer(c.address, nil)("", timeout)
 	if err != nil {
 		return nil, err
 	}

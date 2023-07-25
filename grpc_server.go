@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin/internal/plugin"
@@ -55,10 +56,11 @@ type GRPCServer struct {
 	Stdout io.Reader
 	Stderr io.Reader
 
-	config      GRPCServerConfig
-	server      *grpc.Server
-	broker      *GRPCBroker
-	stdioServer *grpcStdioServer
+	config         GRPCServerConfig
+	server         *grpc.Server
+	broker         *GRPCBroker
+	brokerDialFile *os.File
+	stdioServer    *grpcStdioServer
 
 	logger hclog.Logger
 }
@@ -84,7 +86,7 @@ func (s *GRPCServer) Init() error {
 	// Register the broker service
 	brokerServer := newGRPCBrokerServer()
 	plugin.RegisterGRPCBrokerServer(s.server, brokerServer)
-	s.broker = newGRPCBroker(brokerServer, s.TLS)
+	s.broker = newGRPCBroker(brokerServer, s.TLS, nil, s.brokerDialFile)
 	go s.broker.Run()
 
 	// Register the controller

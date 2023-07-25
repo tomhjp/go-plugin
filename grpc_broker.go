@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -264,6 +265,8 @@ type GRPCBroker struct {
 	streamer streamer
 	streams  map[uint32]*gRPCBrokerPending
 	tls      *tls.Config
+	lnFile   *os.File
+	dialFile *os.File
 	doneCh   chan struct{}
 	o        sync.Once
 
@@ -275,12 +278,14 @@ type gRPCBrokerPending struct {
 	doneCh chan struct{}
 }
 
-func newGRPCBroker(s streamer, tls *tls.Config) *GRPCBroker {
+func newGRPCBroker(s streamer, tls *tls.Config, lnFile, dialFile *os.File) *GRPCBroker {
 	return &GRPCBroker{
 		streamer: s,
 		streams:  make(map[uint32]*gRPCBrokerPending),
 		tls:      tls,
 		doneCh:   make(chan struct{}),
+		lnFile:   lnFile,
+		dialFile: dialFile,
 	}
 }
 
@@ -288,9 +293,18 @@ func newGRPCBroker(s streamer, tls *tls.Config) *GRPCBroker {
 //
 // This should not be called multiple times with the same ID at one time.
 func (b *GRPCBroker) Accept(id uint32) (net.Listener, error) {
-	listener, err := serverListener()
-	if err != nil {
-		return nil, err
+	var listener net.Listener
+	var err error
+	if b.lnFile == nil {
+		listener, err = serverListener()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		listener, err = net.FileListener(b.lnFile)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	err = b.streamer.Send(&plugin.ConnInfo{
@@ -392,7 +406,7 @@ func (b *GRPCBroker) Dial(id uint32) (conn *grpc.ClientConn, err error) {
 		return nil, err
 	}
 
-	return dialGRPCConn(b.tls, netAddrDialer(addr))
+	return dialGRPCConn(b.tls, netAddrDialer(addr, b.dialFile))
 }
 
 // NextId returns a unique ID to use next.

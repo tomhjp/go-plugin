@@ -5,6 +5,7 @@ package plugin
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -12,9 +13,11 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/big"
 	"net"
 	"os"
 	"os/signal"
+	"path"
 	"runtime"
 	"sort"
 	"strconv"
@@ -87,6 +90,13 @@ type ServeConfig struct {
 	// Logger is used to pass a logger into the server. If none is provided the
 	// server will create a default logger.
 	Logger hclog.Logger
+
+	// ListenerFile is the pre-existing socket file to use as a listener. If unset,
+	// a new listener will be created. Only intended for use in the context of
+	// WASI which doesn't have a socket() API in snapshot preview 1.
+	// ListenerFile *os.File
+
+	// DialFile *os.File
 
 	// Test, if non-nil, will put plugin serving into "test mode". This is
 	// meant to be used as part of `go test` within a plugin's codebase to
@@ -222,6 +232,7 @@ func protocolVersion(opts *ServeConfig) (int, Protocol, PluginSet) {
 //
 // This is the method that plugins should call in their main() functions.
 func Serve(opts *ServeConfig) {
+	// fmt.Fprintln(os.Stderr, os.Environ())
 	exitCode := -1
 	// We use this to trigger an `os.Exit` so that we can execute our other
 	// deferred functions. In test mode, we just output the err to stderr
@@ -273,10 +284,70 @@ func Serve(opts *ServeConfig) {
 	}
 
 	// Register a listener so we can accept a connection
-	listener, err := serverListener()
-	if err != nil {
-		logger.Error("plugin init error", "error", err)
-		return
+	var listener net.Listener
+	var err error
+	listenerFileFd := os.Getenv("GO_PLUGIN_LISTENER_FD")
+	listenerFilePath := os.Getenv("GO_PLUGIN_LISTENER_PATH")
+	dialFileFd := os.Getenv("GO_PLUGIN_DIAL_FD")
+	dialFilePath := os.Getenv("GO_PLUGIN_DIAL_PATH")
+	var listenerFile, dialFile *os.File
+	if listenerFilePath != "" && listenerFileFd != "" {
+		fd, err := strconv.ParseInt(listenerFileFd, 10, 64)
+		if err != nil {
+			logger.Error("error parsing listener file fd", "error", err)
+			return
+		}
+		listenerFile = os.NewFile(uintptr(fd), path.Clean(listenerFilePath))
+
+		// wd, _ := os.Getwd()
+		// logger.Info("In", "dir", wd)
+		// entries, _ := os.ReadDir(".")
+		// for _, entry := range entries {
+		// 	logger.Info("Listing dir", "entry", entry.Name())
+		// }
+		// info, err := os.Lstat("kv_hello")
+		// if err != nil {
+		// 	logger.Error("error stat'ing kv_hello file", "error", err)
+		// 	return
+		// }
+		// logger.Info("File info", "name", info.Name(), "size", info.Size(), "mod time", info.ModTime(), "mode", info.Mode(), "is dir", info.IsDir())
+		// info, err = os.Lstat(path.Clean(listenerFilePath))
+		// if err != nil {
+		// 	logger.Error("error stat'ing listener file", "error", err)
+		// 	return
+		// }
+		// logger.Info("File info", "name", info.Name(), "size", info.Size(), "mod time", info.ModTime(), "mode", info.Mode(), "is dir", info.IsDir())
+		// listenerFile, err = os.OpenFile(listenerFilePath, os.O_RDWR, 0o644)
+		// if err != nil {
+		// 	logger.Error("error opening listener file", "error", err)
+		// 	return
+		// }
+	}
+	if dialFilePath != "" && dialFileFd != "" {
+		fd, err := strconv.ParseInt(dialFileFd, 10, 64)
+		if err != nil {
+			logger.Error("error parsing broker dial file fd", "error", err)
+		}
+		dialFile = os.NewFile(uintptr(fd), path.Clean(dialFilePath))
+
+		// dialFile, err = os.OpenFile(dialFilePath, os.O_RDWR, 0o644)
+		// if err != nil {
+		// 	logger.Error("error opening dial file", "error", err)
+		// 	return
+		// }
+	}
+	if listenerFile == nil {
+		listener, err = serverListener()
+		if err != nil {
+			logger.Error("plugin init error", "error", err)
+			return
+		}
+	} else {
+		listener, err = net.FileListener(listenerFile)
+		if err != nil {
+			logger.Error("plugin init error using existing listener file", "fd", listenerFile.Fd(), "path", listenerFile.Name(), "error", err)
+			return
+		}
 	}
 
 	// Close the listener on return. We wrap this in a func() on purpose
@@ -382,13 +453,14 @@ func Serve(opts *ServeConfig) {
 	case ProtocolGRPC:
 		// Create the gRPC server
 		server = &GRPCServer{
-			Plugins: pluginSet,
-			Server:  opts.GRPCServer,
-			TLS:     tlsConfig,
-			Stdout:  stdout_r,
-			Stderr:  stderr_r,
-			DoneCh:  doneCh,
-			logger:  logger,
+			Plugins:        pluginSet,
+			Server:         opts.GRPCServer,
+			TLS:            tlsConfig,
+			Stdout:         stdout_r,
+			Stderr:         stderr_r,
+			DoneCh:         doneCh,
+			logger:         logger,
+			brokerDialFile: dialFile,
 		}
 
 	default:
@@ -547,7 +619,7 @@ func serverListener_tcp() (net.Listener, error) {
 }
 
 func serverListener_unix() (net.Listener, error) {
-	tf, err := ioutil.TempFile("", "plugin")
+	tf, err := ioutil.TempFile(".", "tmpplugin")
 	if err != nil {
 		return nil, err
 	}
@@ -564,6 +636,19 @@ func serverListener_unix() (net.Listener, error) {
 
 	l, err := net.Listen("unix", path)
 	if err != nil {
+		return nil, err
+	}
+
+	rawConn, err := (l.(*net.UnixListener)).SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	var rawFd uintptr
+	err = rawConn.Control(func(fd uintptr) {
+		rawFd = fd
+	})
+	num, _ := rand.Int(rand.Reader, big.NewInt(1000))
+	if err := os.WriteFile(fmt.Sprintf("log%s", num), []byte(fmt.Sprintf("opened listener; rawFd: %v, path: %s\n", rawFd, path)), 0o644); err != nil {
 		return nil, err
 	}
 
