@@ -18,10 +18,12 @@ require (
 	github.com/fatih/color v1.7.0 // indirect
 	github.com/mattn/go-colorable v0.1.4 // indirect
 	github.com/mattn/go-isatty v0.0.10 // indirect
+	github.com/stealthrocket/wasi-go v0.8.0 // indirect
+	github.com/stealthrocket/wazergo v0.19.1 // indirect
 	github.com/stretchr/testify v1.3.0 // indirect
 	github.com/tetratelabs/wazero v1.3.1 // indirect
 	golang.org/x/net v0.0.0-20190311183353-d8887717615a // indirect
-	golang.org/x/sys v0.6.0 // indirect
+	golang.org/x/sys v0.8.0 // indirect
 	golang.org/x/text v0.3.0 // indirect
 	google.golang.org/genproto v0.0.0-20190819201941-24fa4b261c55 // indirect
 )

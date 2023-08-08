@@ -21,19 +21,18 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
+	"github.com/stealthrocket/wasi-go"
+	"github.com/stealthrocket/wasi-go/imports"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
-	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 	"github.com/tetratelabs/wazero/sys"
 	"google.golang.org/grpc"
 )
@@ -611,67 +610,47 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		stderr := bytes.NewBuffer(nil)
 		cmdStderr = stderr
 		ctx := context.Background()
-		r := wazero.NewRuntime(ctx)
-		_, err = wasi_snapshot_preview1.Instantiate(ctx, r)
-		if err != nil {
-			return nil, err
-		}
+		runtime := wazero.NewRuntime(ctx)
+		// defer runtime.Close(ctx)
 
-		// Create server and client sockets for WASM module to use.
-		hostLn, err := serverListener()
+		wasmCode, err := os.ReadFile(cmd.Path)
 		if err != nil {
-			return nil, fmt.Errorf("error starting host listener: %w", err)
+			return nil, err
 		}
-		defer hostLn.Close()
-		pluginLn, err := serverListener()
+		wasmModule, err := runtime.CompileModule(ctx, wasmCode)
 		if err != nil {
-			return nil, fmt.Errorf("error starting plugin listener: %w", err)
+			return nil, err
 		}
+		// defer wasmModule.Close(ctx)
 
-		info, err := os.Lstat(path.Clean(pluginLn.Addr().String()))
-		if err != nil {
-			return nil, fmt.Errorf("error stat'ing listener file: %w", err)
-		}
-		c.logger.Info("File info", "name", info.Name(), "size", info.Size(), "mod time", info.ModTime(), "mode", info.Mode(), "is dir", info.IsDir())
-		//defer pluginLn.Close()
-		// hostConn, err := netAddrDialer(pluginLn.Addr(), nil)("", 0)
-		// if err != nil {
-		// 	return nil, fmt.Errorf("error connecting to plugin listener: %w", err)
-		// }
-		pluginConn, err := netAddrDialer(hostLn.Addr(), nil)("", 0)
-		if err != nil {
-			return nil, fmt.Errorf("error connecting to host listener: %w", err)
-		}
-		fdFromConn := func(conn syscall.Conn) (uintptr, error) {
-			rawConn, err := conn.SyscallConn()
-			if err != nil {
-				return 0, err
-			}
-			var rawFd uintptr
-			err = rawConn.Control(func(fd uintptr) {
-				rawFd = fd
-			})
-			return rawFd, nil
-		}
-		pluginLnFd, err := fdFromConn(pluginLn.(*rmListener).Listener.(*net.UnixListener))
+		builder := imports.NewBuilder().
+			WithName("plugin").
+			WithArgs(append([]string{cmd.Path}, cmd.Args...)...).
+			WithEnv(envs...).
+			WithDirs(dirs...).
+			WithListens(listens...).
+			WithDials(dials...).
+			WithNonBlockingStdio(nonBlockingStdio).
+			WithSocketsExtension(socketExt, wasmModule)
+			// WithTracer(trace, os.Stderr, wasi.WithTracerStringSize(tracerStringSize)).
+			// WithMaxOpenFiles(maxOpenFiles).
+			// WithMaxOpenDirs(maxOpenDirs)
+
+		var system wasi.System
+		ctx, system, err = builder.Instantiate(ctx, runtime)
 		if err != nil {
 			return nil, err
 		}
-		pluginConnFd, err := fdFromConn(pluginConn.(*net.UnixConn))
+		// defer system.Close(ctx)
+
+		instance, err := runtime.InstantiateModule(ctx, wasmModule, wazero.NewModuleConfig().
+			WithStdin(os.Stdin).
+			WithStdout(stdout).
+			WithStderr(stderr))
 		if err != nil {
 			return nil, err
 		}
-		hostLnFd, err := fdFromConn(hostLn.(*rmListener).Listener.(*net.UnixListener))
-		if err != nil {
-			return nil, err
-		}
-		c.lnFile = os.NewFile(hostLnFd, hostLn.Addr().String())
-		cmd.Env = append(cmd.Env,
-			fmt.Sprintf("GO_PLUGIN_LISTENER_FD=%v", pluginLnFd),
-			fmt.Sprintf("GO_PLUGIN_LISTENER_PATH=%v", pluginLn.Addr().String()),
-			fmt.Sprintf("GO_PLUGIN_DIAL_FD=%v", pluginConnFd),
-			fmt.Sprintf("GO_PLUGIN_DIAL_PATH=%v", pluginConn.RemoteAddr().String()),
-		)
+		// return instance.Close(ctx)
 
 		config := wazero.NewModuleConfig().
 			WithStdin(os.Stdin).
@@ -687,10 +666,6 @@ func (c *Client) Start() (addr net.Addr, err error) {
 			}
 			// c.logger.Info("setting env", "key", parts[0], "value", parts[1])
 			config = config.WithEnv(parts[0], parts[1])
-		}
-		moduleBytes, err := os.ReadFile(cmd.Path)
-		if err != nil {
-			return nil, err
 		}
 		var wg sync.WaitGroup
 		var module api.Module
