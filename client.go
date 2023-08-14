@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,10 +27,12 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-plugin/config"
+	"github.com/hashicorp/go-plugin/internal/runner"
 	"google.golang.org/grpc"
 )
 
-const unrecognizedRemotePluginMessage = `Unrecognized remote plugin message: %s
+const unrecognizedRemotePluginMessage = `Unrecognized remote plugin message: %q
 This usually means
   the plugin was not compiled for this architecture,
   the plugin is missing dynamic-link libraries necessary to run,
@@ -87,7 +90,7 @@ type Client struct {
 	exited            bool
 	l                 sync.Mutex
 	address           net.Addr
-	process           *os.Process
+	runner            runner.Runner
 	client            ClientProtocol
 	protocol          Protocol
 	logger            hclog.Logger
@@ -106,6 +109,8 @@ type Client struct {
 	// processKilled is used for testing only, to flag when the process was
 	// forcefully killed.
 	processKilled bool
+
+	hostSocketDir string
 }
 
 // NegotiatedVersion returns the protocol version negotiated with the server.
@@ -140,6 +145,8 @@ type ClientConfig struct {
 	// that is already running. This isn't common.
 	Cmd      *exec.Cmd
 	Reattach *ReattachConfig
+
+	DockerConfig *config.ContainerConfig
 
 	// SecureConfig is configuration for verifying the integrity of the
 	// executable. It can not be used with Reattach.
@@ -418,12 +425,12 @@ func (c *Client) killed() bool {
 func (c *Client) Kill() {
 	// Grab a lock to read some private fields.
 	c.l.Lock()
-	process := c.process
+	runner := c.runner
 	addr := c.address
 	c.l.Unlock()
 
-	// If there is no process, there is nothing to kill.
-	if process == nil {
+	// If there is no runner or ID, there is nothing to kill.
+	if runner == nil || runner.ID() == "" {
 		return
 	}
 
@@ -434,7 +441,7 @@ func (c *Client) Kill() {
 		// Make sure there is no reference to the old process after it has been
 		// killed.
 		c.l.Lock()
-		c.process = nil
+		c.runner = nil
 		c.l.Unlock()
 	}()
 
@@ -477,7 +484,7 @@ func (c *Client) Kill() {
 
 	// If graceful exiting failed, just kill it
 	c.logger.Warn("plugin failed to exit gracefully")
-	process.Kill()
+	runner.Kill()
 
 	c.l.Lock()
 	c.processKilled = true
@@ -506,6 +513,10 @@ func (c *Client) Start() (addr net.Addr, err error) {
 
 	if c.address != nil {
 		return c.address, nil
+	}
+
+	if c.config.DockerConfig != nil && runtime.GOOS != "linux" {
+		return nil, errors.New("running plugins in docker is only supported on linux")
 	}
 
 	// If one of cmd or reattach isn't set, then it is an error. We wrap
@@ -555,18 +566,13 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	}
 
 	cmd := c.config.Cmd
-	cmd.Env = append(cmd.Env, os.Environ()...)
+	// Don't add host environment variables if we're isolating the plugin from
+	// the host environment.
+	if c.config.DockerConfig == nil {
+		cmd.Env = append(cmd.Env, os.Environ()...)
+	}
 	cmd.Env = append(cmd.Env, env...)
 	cmd.Stdin = os.Stdin
-
-	cmdStdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	cmdStderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
 
 	if c.config.SecureConfig != nil {
 		if ok, err := c.config.SecureConfig.Check(cmd.Path); err != nil {
@@ -601,26 +607,42 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		}
 	}
 
-	c.logger.Debug("starting plugin", "path", cmd.Path, "args", cmd.Args)
-	err = cmd.Start()
-	if err != nil {
-		return
+	switch {
+	case c.config.DockerConfig != nil:
+		// TODO: Figure out correct lifecyle hook to delete temp dir. Probably on Kill?
+		hostSocketDir, err := os.MkdirTemp("", "")
+		if err != nil {
+			return nil, err
+		}
+		c.logger.Trace("created temporary directory for unix sockets", "dir", hostSocketDir)
+		c.hostSocketDir = hostSocketDir
+		c.runner, err = runner.NewContainerRunner(c.logger, cmd, c.config.DockerConfig, hostSocketDir)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		c.runner, err = runner.NewCmdRunner(c.logger, cmd)
+		if err != nil {
+			return nil, err
+		}
+
 	}
 
-	// Set the process
-	c.process = cmd.Process
-	c.logger.Debug("plugin started", "path", cmd.Path, "pid", c.process.Pid)
+	err = c.runner.Start()
+	if err != nil {
+		return nil, err
+	}
 
 	// Make sure the command is properly cleaned up if there is an error
 	defer func() {
-		r := recover()
+		rErr := recover()
 
-		if err != nil || r != nil {
-			cmd.Process.Kill()
+		if err != nil || rErr != nil {
+			c.runner.Kill()
 		}
 
-		if r != nil {
-			panic(r)
+		if rErr != nil {
+			panic(rErr)
 		}
 	}()
 
@@ -631,7 +653,7 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	c.clientWaitGroup.Add(1)
 	c.stderrWaitGroup.Add(1)
 	// logStderr calls Done()
-	go c.logStderr(cmdStderr)
+	go c.logStderr(c.runner.Stderr())
 
 	c.clientWaitGroup.Add(1)
 	go func() {
@@ -640,29 +662,17 @@ func (c *Client) Start() (addr net.Addr, err error) {
 
 		defer c.clientWaitGroup.Done()
 
-		// get the cmd info early, since the process information will be removed
-		// in Kill.
-		pid := c.process.Pid
-		path := cmd.Path
-
 		// wait to finish reading from stderr since the stderr pipe reader
 		// will be closed by the subsequent call to cmd.Wait().
 		c.stderrWaitGroup.Wait()
 
 		// Wait for the command to end.
-		err := cmd.Wait()
-
-		msgArgs := []interface{}{
-			"path", path,
-			"pid", pid,
-		}
+		err := c.runner.Wait()
 		if err != nil {
-			msgArgs = append(msgArgs,
-				[]interface{}{"error", err.Error()}...)
-			c.logger.Error("plugin process exited", msgArgs...)
+			c.logger.Error("plugin process exited", "plugin", c.runner.Name(), "id", c.runner.ID(), "error", err.Error())
 		} else {
 			// Log and make sure to flush the logs right away
-			c.logger.Info("plugin process exited", msgArgs...)
+			c.logger.Info("plugin process exited", "plugin", c.runner.Name(), "id", c.runner.ID())
 		}
 
 		os.Stderr.Sync()
@@ -681,9 +691,12 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		defer c.clientWaitGroup.Done()
 		defer close(linesCh)
 
-		scanner := bufio.NewScanner(cmdStdout)
+		scanner := bufio.NewScanner(c.runner.Stdout())
 		for scanner.Scan() {
 			linesCh <- scanner.Text()
+		}
+		if scanner.Err() != nil {
+			c.logger.Error("error encountered while scanning stdout", "error", scanner.Err())
 		}
 	}()
 
@@ -751,13 +764,9 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		c.negotiatedVersion = version
 		c.logger.Debug("using plugin", "version", version)
 
-		switch parts[2] {
-		case "tcp":
-			addr, err = net.ResolveTCPAddr("tcp", parts[3])
-		case "unix":
-			addr, err = net.ResolveUnixAddr("unix", parts[3])
-		default:
-			err = fmt.Errorf("Unknown address type: %s", parts[3])
+		addr, err = c.runner.ResolveAddr(parts[2], parts[3])
+		if err != nil {
+			return addr, err
 		}
 
 		// If we have a server type, then record that. We default to net/rpc
@@ -877,7 +886,7 @@ func (c *Client) reattach() (net.Addr, error) {
 	// process being killed (the only purpose we have for c.process), since
 	// in test mode the process is responsible for exiting on its own.
 	if !c.config.Reattach.Test {
-		c.process = p
+		// c.process = p
 	}
 
 	return c.address, nil

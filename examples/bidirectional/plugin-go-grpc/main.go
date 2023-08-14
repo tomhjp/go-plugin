@@ -33,11 +33,11 @@ func (k *Counter) Put(key string, value int64, a shared.AddHelper) error {
 		return err
 	}
 
-	return ioutil.WriteFile("kv_"+key, buf, 0644)
+	return ioutil.WriteFile("/tmp/kv_"+key, buf, 0644)
 }
 
 func (k *Counter) Get(key string) (int64, error) {
-	dataRaw, err := ioutil.ReadFile("kv_" + key)
+	dataRaw, err := ioutil.ReadFile("/tmp/kv_" + key)
 	if err != nil {
 		return 0, err
 	}

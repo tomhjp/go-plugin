@@ -60,6 +60,8 @@ type GRPCServer struct {
 	broker      *GRPCBroker
 	stdioServer *grpcStdioServer
 
+	socketDir string
+
 	logger hclog.Logger
 }
 
@@ -84,7 +86,7 @@ func (s *GRPCServer) Init() error {
 	// Register the broker service
 	brokerServer := newGRPCBrokerServer()
 	plugin.RegisterGRPCBrokerServer(s.server, brokerServer)
-	s.broker = newGRPCBroker(brokerServer, s.TLS)
+	s.broker = newGRPCBroker(brokerServer, s.TLS, s.socketDir)
 	go s.broker.Run()
 
 	// Register the controller

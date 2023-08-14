@@ -38,7 +38,9 @@ func (m *GRPCClient) Put(key string, value int64, a AddHelper) error {
 		Value:     value,
 	})
 
-	s.Stop()
+	if s != nil {
+		s.Stop()
+	}
 	return err
 }
 

@@ -5,13 +5,14 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"strconv"
 
+	"github.com/docker/docker/api/types/container"
 	"github.com/hashicorp/go-plugin"
+	"github.com/hashicorp/go-plugin/config"
 	"github.com/hashicorp/go-plugin/examples/bidirectional/shared"
 )
 
@@ -22,14 +23,48 @@ func (*addHelper) Sum(a, b int64) (int64, error) {
 }
 
 func main() {
-	// We don't want to see the plugin logs.
-	log.SetOutput(ioutil.Discard)
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
 
+func run() error {
+	// We don't want to see the plugin logs.
+	//log.SetOutput(ioutil.Discard)
+
+	// defer os.RemoveAll(tmpDir)
 	// We're a host. Start by launching the plugin process.
 	client := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig: shared.Handshake,
 		Plugins:         shared.PluginMap,
-		Cmd:             exec.Command("sh", "-c", os.Getenv("COUNTER_PLUGIN")),
+		Cmd:             exec.Command(""),
+		DockerConfig: &config.ContainerConfig{
+			UnixSocketGroup: os.Getgid(),
+			ContainerConfig: &container.Config{
+				Image: "counter-go-grpc",
+				// AttachStdin: true,
+				// AttachStdout: true,
+				// AttachStderr: true,
+				// Tty:     true,
+				// Volumes: map[string]struct{}{},
+				// User:    "1000:1000",
+			},
+			HostConfig: &container.HostConfig{
+				// Binds:          []string{},
+				// NetworkMode:    container.NetworkMode("default"),
+				AutoRemove: true,
+				// GroupAdd: []string{},
+				// Cgroup:         container.CgroupSpec(""),
+				// CgroupnsMode:   container.CgroupnsModeEmpty,
+				// ReadonlyRootfs: true,
+				// Runtime:        "runsc",
+				// Resources:      container.Resources{},
+				// StorageOpt:     map[string]string{},
+			},
+			// NetworkConfig: &network.NetworkingConfig{
+			// 	EndpointsConfig: map[string]*network.EndpointSettings{},
+			// },
+		},
 		AllowedProtocols: []plugin.Protocol{
 			plugin.ProtocolNetRPC, plugin.ProtocolGRPC},
 	})
@@ -38,15 +73,13 @@ func main() {
 	// Connect via RPC
 	rpcClient, err := client.Client()
 	if err != nil {
-		fmt.Println("Error:", err.Error())
-		os.Exit(1)
+		return fmt.Errorf("error starting client: %w", err)
 	}
 
 	// Request the plugin
 	raw, err := rpcClient.Dispense("counter")
 	if err != nil {
-		fmt.Println("Error:", err.Error())
-		os.Exit(1)
+		return err
 	}
 
 	// We should have a Counter store now! This feels like a normal interface
@@ -58,8 +91,7 @@ func main() {
 	case "get":
 		result, err := counter.Get(os.Args[1])
 		if err != nil {
-			fmt.Println("Error:", err.Error())
-			os.Exit(1)
+			return err
 		}
 
 		fmt.Println(result)
@@ -67,18 +99,17 @@ func main() {
 	case "put":
 		i, err := strconv.Atoi(os.Args[2])
 		if err != nil {
-			fmt.Println("Error:", err.Error())
-			os.Exit(1)
+			return err
 		}
 
 		err = counter.Put(os.Args[1], int64(i), &addHelper{})
 		if err != nil {
-			fmt.Println("Error:", err.Error())
-			os.Exit(1)
+			return err
 		}
 
 	default:
-		fmt.Println("Please only use 'get' or 'put'")
-		os.Exit(1)
+		return fmt.Errorf("Please only use 'get' or 'put'")
 	}
+
+	return nil
 }

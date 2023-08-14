@@ -15,12 +15,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 
 	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-plugin/internal/constants"
 	"google.golang.org/grpc"
 )
 
@@ -273,7 +275,8 @@ func Serve(opts *ServeConfig) {
 	}
 
 	// Register a listener so we can accept a connection
-	listener, err := serverListener()
+	socketDir := os.Getenv(constants.EnvUnixSocketDir)
+	listener, err := serverListener(socketDir)
 	if err != nil {
 		logger.Error("plugin init error", "error", err)
 		return
@@ -382,13 +385,14 @@ func Serve(opts *ServeConfig) {
 	case ProtocolGRPC:
 		// Create the gRPC server
 		server = &GRPCServer{
-			Plugins: pluginSet,
-			Server:  opts.GRPCServer,
-			TLS:     tlsConfig,
-			Stdout:  stdout_r,
-			Stderr:  stderr_r,
-			DoneCh:  doneCh,
-			logger:  logger,
+			Plugins:   pluginSet,
+			Server:    opts.GRPCServer,
+			TLS:       tlsConfig,
+			Stdout:    stdout_r,
+			Stderr:    stderr_r,
+			DoneCh:    doneCh,
+			logger:    logger,
+			socketDir: socketDir,
 		}
 
 	default:
@@ -407,11 +411,15 @@ func Serve(opts *ServeConfig) {
 	// bring it up. In test mode, we don't do this because clients will
 	// attach via a reattach config.
 	if opts.Test == nil {
+		advertiseAddr := listener.Addr().String()
+		if socketDir != "" {
+			advertiseAddr = "PLUGIN_UNIX_SOCKET_DIR:" + path.Base(advertiseAddr)
+		}
 		fmt.Printf("%d|%d|%s|%s|%s|%s\n",
 			CoreProtocolVersion,
 			protoVersion,
 			listener.Addr().Network(),
-			listener.Addr().String(),
+			advertiseAddr,
 			protoType,
 			serverCert)
 		os.Stdout.Sync()
@@ -496,12 +504,12 @@ func Serve(opts *ServeConfig) {
 	}
 }
 
-func serverListener() (net.Listener, error) {
+func serverListener(dir string) (net.Listener, error) {
 	if runtime.GOOS == "windows" {
 		return serverListener_tcp()
 	}
 
-	return serverListener_unix()
+	return serverListener_unix(dir)
 }
 
 func serverListener_tcp() (net.Listener, error) {
@@ -546,8 +554,8 @@ func serverListener_tcp() (net.Listener, error) {
 	return nil, errors.New("Couldn't bind plugin TCP listener")
 }
 
-func serverListener_unix() (net.Listener, error) {
-	tf, err := ioutil.TempFile("", "plugin")
+func serverListener_unix(dir string) (net.Listener, error) {
+	tf, err := ioutil.TempFile(dir, "plugin")
 	if err != nil {
 		return nil, err
 	}
@@ -565,6 +573,25 @@ func serverListener_unix() (net.Listener, error) {
 	l, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err
+	}
+
+	// By default, unix sockets are only writable by the owner. Set up a custom
+	// group owner and group write permissions if configured.
+	if groupString := os.Getenv(constants.EnvUnixSocketGroup); groupString != "" {
+		group, err := strconv.Atoi(groupString)
+		if err != nil {
+			return nil, fmt.Errorf("non-integer %s environment variable specified: %s", constants.EnvUnixSocketGroup, groupString)
+		}
+
+		err = os.Chown(path, -1, group)
+		if err != nil {
+			return nil, err
+		}
+
+		err = os.Chmod(path, 0o660)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Wrap the listener in rmListener so that the Unix domain socket file

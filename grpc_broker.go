@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -267,6 +269,8 @@ type GRPCBroker struct {
 	doneCh   chan struct{}
 	o        sync.Once
 
+	socketDir string
+
 	sync.Mutex
 }
 
@@ -275,12 +279,14 @@ type gRPCBrokerPending struct {
 	doneCh chan struct{}
 }
 
-func newGRPCBroker(s streamer, tls *tls.Config) *GRPCBroker {
+func newGRPCBroker(s streamer, tls *tls.Config, socketDir string) *GRPCBroker {
 	return &GRPCBroker{
 		streamer: s,
 		streams:  make(map[uint32]*gRPCBrokerPending),
 		tls:      tls,
 		doneCh:   make(chan struct{}),
+
+		socketDir: socketDir,
 	}
 }
 
@@ -288,15 +294,19 @@ func newGRPCBroker(s streamer, tls *tls.Config) *GRPCBroker {
 //
 // This should not be called multiple times with the same ID at one time.
 func (b *GRPCBroker) Accept(id uint32) (net.Listener, error) {
-	listener, err := serverListener()
+	listener, err := serverListener(b.socketDir)
 	if err != nil {
 		return nil, err
 	}
 
+	advertiseAddr := listener.Addr().String()
+	if b.socketDir != "" {
+		advertiseAddr = "PLUGIN_UNIX_SOCKET_DIR:" + path.Base(advertiseAddr)
+	}
 	err = b.streamer.Send(&plugin.ConnInfo{
 		ServiceId: id,
 		Network:   listener.Addr().Network(),
-		Address:   listener.Addr().String(),
+		Address:   advertiseAddr,
 	})
 	if err != nil {
 		return nil, err
@@ -384,7 +394,11 @@ func (b *GRPCBroker) Dial(id uint32) (conn *grpc.ClientConn, err error) {
 	case "tcp":
 		addr, err = net.ResolveTCPAddr("tcp", c.Address)
 	case "unix":
-		addr, err = net.ResolveUnixAddr("unix", c.Address)
+		address := c.Address
+		if strings.HasPrefix(c.Address, "PLUGIN_UNIX_SOCKET_DIR:") {
+			address = path.Join(b.socketDir, strings.TrimPrefix(address, "PLUGIN_UNIX_SOCKET_DIR:"))
+		}
+		addr, err = net.ResolveUnixAddr("unix", address)
 	default:
 		err = fmt.Errorf("Unknown address type: %s", c.Address)
 	}
